@@ -53,3 +53,7 @@ class ConfigError(HydroError):
 
 class NamespaceError(HydroError):
     """命名空间重复注册或解析失败。"""
+
+
+class HandoverError(HydroError):
+    """班次交接状态不满足动作要求（未封口就签署、冻结后再改等）。"""

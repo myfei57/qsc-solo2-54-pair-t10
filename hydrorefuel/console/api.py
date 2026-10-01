@@ -57,6 +57,19 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
+        add("GET", "/api/handover/shifts", lambda params, body: self._platform.handover_shifts())
+        add("GET", "/api/handover/draft", self._handover_draft)
+        add("GET", "/api/handover/current", self._handover_current)
+        add("GET", "/api/handover/versions", self._handover_versions)
+        add("GET", "/api/handover/version", self._handover_version)
+        add("GET", "/api/handover/reconcile", self._handover_reconcile)
+        add("POST", "/api/handover/open", self._handover_open)
+        add("POST", "/api/handover/fact", self._handover_fact)
+        add("POST", "/api/handover/seal", self._handover_seal)
+        add("POST", "/api/handover/sign", self._handover_sign)
+        add("POST", "/api/handover/correct", self._handover_correct)
+        add("POST", "/api/handover/candidate/sign", self._handover_candidate_sign)
+        add("POST", "/api/handover/candidate/cancel", self._handover_candidate_cancel)
         add("POST", "/api/step", self._step)
         add("POST", "/api/unload", self._unload)
         add("POST", "/api/pressurize", self._pressurize)
@@ -184,3 +197,61 @@ class Api:
 
     def _concurrency(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_probe(rounds=int(body.get("rounds", 24)))
+
+    def _shift_arg(self, params: dict, body: dict) -> str | None:
+        value = body.get("shift_id", params.get("shift_id"))
+        return None if value in (None, "") else str(value)
+
+    def _handover_open(self, params: dict, body: dict) -> dict:
+        return {"shift": self._platform.handover_open_shift(self._shift_arg(params, body))}
+
+    def _handover_fact(self, params: dict, body: dict) -> dict:
+        return {"fact": self._platform.handover_record_fact(
+            str(body["record_type"]), dict(body["values"]), shift_id=self._shift_arg(params, body)
+        )}
+
+    def _handover_seal(self, params: dict, body: dict) -> dict:
+        return {"shift": self._platform.handover_seal(self._shift_arg(params, body))}
+
+    def _handover_sign(self, params: dict, body: dict) -> dict:
+        return {"version": self._platform.handover_sign(str(body.get("signer", "")), self._shift_arg(params, body))}
+
+    def _handover_correct(self, params: dict, body: dict) -> dict:
+        return {"correction": self._platform.handover_correct(
+            fact_id=str(body["fact_id"]),
+            field=str(body["field"]),
+            new_value=body["new_value"],
+            reason=str(body.get("reason", "")),
+            author=str(body.get("author", "")),
+            idem_key=str(body.get("idem_key", "")),
+            shift_id=self._shift_arg(params, body),
+        )}
+
+    def _handover_candidate_sign(self, params: dict, body: dict) -> dict:
+        return {"version": self._platform.handover_sign_candidate(
+            str(body.get("signer", "")), self._shift_arg(params, body)
+        )}
+
+    def _handover_candidate_cancel(self, params: dict, body: dict) -> dict:
+        return {"cancel": self._platform.handover_cancel_candidate(
+            reason=str(body.get("reason", "")),
+            author=str(body.get("author", "")),
+            shift_id=self._shift_arg(params, body),
+        )}
+
+    def _handover_draft(self, params: dict, body: dict) -> dict:
+        return self._platform.handover_draft(self._shift_arg(params, body))
+
+    def _handover_current(self, params: dict, body: dict) -> dict:
+        return {"version": self._platform.handover_current(self._shift_arg(params, body))}
+
+    def _handover_versions(self, params: dict, body: dict) -> dict:
+        return self._platform.handover_versions(str(params["shift_id"]))
+
+    def _handover_version(self, params: dict, body: dict) -> dict:
+        return {"version": self._platform.handover_version(
+            str(params["shift_id"]), str(params.get("version", "v1"))
+        )}
+
+    def _handover_reconcile(self, params: dict, body: dict) -> dict:
+        return self._platform.handover_reconcile(self._shift_arg(params, body))

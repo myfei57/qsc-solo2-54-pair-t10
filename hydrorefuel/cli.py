@@ -141,6 +141,48 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_handover(args: argparse.Namespace) -> int:
+    """班次交接：封口、签署、更正、重开与核对。"""
+
+    platform = _build(args)
+    shift = getattr(args, "shift_id", None) or None
+    if args.action == "shifts":
+        _dump(platform.handover_shifts())
+    elif args.action == "draft":
+        _dump(platform.handover_draft(shift))
+    elif args.action == "seal":
+        _dump({"shift": platform.handover_seal(shift)})
+    elif args.action == "sign":
+        _dump({"version": platform.handover_sign(args.signer, shift)})
+    elif args.action == "current":
+        _dump({"version": platform.handover_current(shift)})
+    elif args.action == "versions":
+        _dump(platform.handover_versions(args.shift_id))
+    elif args.action == "correct":
+        _dump(
+            {
+                "correction": platform.handover_correct(
+                    fact_id=args.fact_id,
+                    field=args.field,
+                    new_value=args.new_value,
+                    reason=args.reason,
+                    author=args.author,
+                    idem_key=args.idem_key,
+                    shift_id=shift,
+                )
+            }
+        )
+    elif args.action == "candidate-sign":
+        _dump({"version": platform.handover_sign_candidate(args.signer, shift)})
+    elif args.action == "candidate-cancel":
+        _dump({"cancel": platform.handover_cancel_candidate(reason=args.reason, author=args.author, shift_id=shift)})
+    elif args.action == "reconcile":
+        _dump(platform.handover_reconcile(shift))
+    else:  # pragma: no cover - argparse 已限定取值
+        raise ValueError(f"未知交接动作: {args.action}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -175,6 +217,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    handover = sub.add_parser("handover", help="班次交接：封口、签署、更正与核对", parents=[common])
+    handover.add_argument(
+        "action",
+        choices=(
+            "shifts", "draft", "seal", "sign", "current", "versions",
+            "correct", "candidate-sign", "candidate-cancel", "reconcile",
+        ),
+    )
+    handover.add_argument("--shift-id", default=argparse.SUPPRESS, help="班次标识（缺省取当前/最近班次）")
+    handover.add_argument("--signer", default="", help="签署人（sign / candidate-sign 必填）")
+    handover.add_argument("--fact-id", default="", help="更正目标事实标识")
+    handover.add_argument("--field", default="", help="更正字段")
+    handover.add_argument("--new-value", default=None, help="更正值")
+    handover.add_argument("--reason", default="", help="更正/撤销理由（必填）")
+    handover.add_argument("--author", default="", help="更正/撤销操作人（必填）")
+    handover.add_argument("--idem-key", default="", help="更正幂等键（必填）")
+    handover.set_defaults(func=_cmd_handover)
     return parser
 
 

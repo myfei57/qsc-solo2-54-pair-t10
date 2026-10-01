@@ -31,6 +31,12 @@ from .eventbus import Event, EventBus
 from .flow.meter import MassFlowMeter
 from .flow.snapshot import FlowSnapshot
 from .flow.step import FlowStep
+from .handover import (
+    BUFFER_CHARGE,
+    FILL_TRANSACTION,
+    UNLOAD_RECEIPT,
+    HandoverLedger,
+)
 from .ids import IdFactory
 from .leak.detector import LeakDetector
 from .leak.latch import LeakLatch
@@ -70,6 +76,13 @@ class Platform:
         store = JsonStore(self.config.storage_root)
         self.store = store
         self.audit = AuditLog(self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512))
+        # 班次交接台账与审计共用事件总线：冻结、更正事件自动落审计。
+        self.handover = HandoverLedger(
+            store.root,
+            secret=f"handover-secret/{unit}",
+            clock=self.clock,
+            bus=self.bus,
+        )
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=5.0)
@@ -201,6 +214,108 @@ class Platform:
         )
         return summary
 
+    @staticmethod
+    def _step_value(report: dict, component: str, action: str, key: str) -> object | None:
+        """从编排报告里取某组件某步骤明细的一个字段，取不到返回 None。"""
+
+        for step in report.get("steps", []):
+            if step.get("component") == component and step.get("action") == action:
+                detail = step.get("detail", {})
+                if key in detail:
+                    return detail[key]
+        return None
+
+    def _capture_handover_fact(self, record_type: str, values: dict) -> None:
+        """把一次成功操作的充装事实归集进当班草稿。
+
+        只有存在"进行中（未封口）"的班次时才归集；没有开班或已封口都不影响
+        正常作业，静默跳过——作业链路不能因为交接台账被反向阻塞。
+        """
+
+        try:
+            self.handover.record_fact(record_type, values)
+        except HydroError:
+            pass
+
+    # ------------------------------------------------------------ 班次交接
+
+    def handover_open_shift(self, shift_id: str | None = None) -> dict:
+        with self._lock:
+            return self.handover.open_shift(shift_id)
+
+    def handover_record_fact(self, record_type: str, values: dict, shift_id: str | None = None) -> dict:
+        with self._lock:
+            return self.handover.record_fact(record_type, values, shift_id=shift_id)
+
+    def handover_seal(self, shift_id: str | None = None) -> dict:
+        with self._lock:
+            return self.handover.seal_shift(shift_id)
+
+    def handover_sign(self, signer: str, shift_id: str | None = None) -> dict:
+        with self._lock:
+            return self.handover.sign_shift(signer, shift_id)
+
+    def handover_correct(
+        self,
+        *,
+        fact_id: str,
+        field: str,
+        new_value: object,
+        reason: str,
+        author: str,
+        idem_key: str,
+        shift_id: str | None = None,
+    ) -> dict:
+        with self._lock:
+            return self.handover.submit_correction(
+                fact_id=fact_id,
+                field=field,
+                new_value=new_value,
+                reason=reason,
+                author=author,
+                idem_key=idem_key,
+                shift_id=shift_id,
+            )
+
+    def handover_sign_candidate(self, signer: str, shift_id: str | None = None) -> dict:
+        with self._lock:
+            return self.handover.sign_candidate(signer, shift_id)
+
+    def handover_cancel_candidate(
+        self, *, reason: str, author: str, shift_id: str | None = None
+    ) -> dict:
+        with self._lock:
+            return self.handover.cancel_candidate(reason=reason, author=author, shift_id=shift_id)
+
+    def handover_current(self, shift_id: str | None = None) -> dict:
+        """对外取数：当前冻结版（叠加追加更正），不见草稿。"""
+
+        with self._lock:
+            return self.handover.current_version(shift_id)
+
+    def handover_versions(self, shift_id: str) -> dict:
+        with self._lock:
+            return {"shift_id": shift_id, "versions": self.handover.list_versions(shift_id)}
+
+    def handover_version(self, shift_id: str, label: str) -> dict:
+        with self._lock:
+            return self.handover.get_version(shift_id, label)
+
+    def handover_shifts(self) -> dict:
+        with self._lock:
+            return {"shifts": self.handover.list_shifts()}
+
+    def handover_draft(self, shift_id: str | None = None) -> dict:
+        with self._lock:
+            return self.handover.draft_facts(shift_id)
+
+    def handover_reconcile(self, shift_id: str | None = None) -> dict:
+        """核对冻结、更正、审计三处：审计证据取自落盘审计流水全量。"""
+
+        with self._lock:
+            audit_entries = self.audit.replay_from_journal()
+            return self.handover.reconcile(shift_id, audit_entries=audit_entries)
+
     def start(self) -> dict:
         """启动平台：核对拓扑与命名空间。"""
 
@@ -236,6 +351,10 @@ class Platform:
             op_id = self.ids.next()
             report = unload_truck(self.truck, self.vent, self.vent_latch, self.unit, hose_pressure_mpa, target_kg, dt)
             summary = self._record_operation(op_id, "unload", report)
+            if report.get("ok"):
+                delivered = self._step_value(report, "truck", "transfer", "delivered_kg")
+                if delivered is not None:
+                    self._capture_handover_fact(UNLOAD_RECEIPT, {"delivered_kg": delivered})
             self._operations += 1
             self._persist()
             return {**report, **summary}
@@ -264,6 +383,12 @@ class Platform:
                 dt=dt,
             )
             summary = self._record_operation(op_id, "pressurize", report)
+            if report.get("ok"):
+                pressure = self._step_value(report, "buffer", "cache", "pressure_mpa")
+                self._capture_handover_fact(
+                    BUFFER_CHARGE,
+                    {"charge_kg": charge_kg, **({"pressure_mpa": pressure} if pressure is not None else {})},
+                )
             self._operations += 1
             self._persist()
             return {**report, **summary}
@@ -306,6 +431,12 @@ class Platform:
                 except HydroError as error:
                     self.note_error(error)
             summary = self._record_operation(op_id, "fill", report)
+            if report.get("ok"):
+                mass = self.meter.total_kg() - before
+                self._capture_handover_fact(
+                    FILL_TRANSACTION,
+                    {"vehicle": vehicle, "mass_kg": round(mass, 3), "rate_kg_per_min": rate_kg_per_min, "steps": steps},
+                )
             self._operations += 1
             self._persist()
             return {**report, **summary}
