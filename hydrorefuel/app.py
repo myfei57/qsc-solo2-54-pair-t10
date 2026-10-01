@@ -41,6 +41,7 @@ from .queue.confirm import Confirmation
 from .queue.queue import FillQueue
 from .queue.snapshot import QueueSnapshot
 from .sequence import fill_vehicle, pressurize_buffer, stop_fill, unload_truck
+from .shift.book import ShiftBook
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
 from .telemetry import TrendBuffer
@@ -51,6 +52,15 @@ from .vent.valve import VentValve
 
 DEFAULT_UNIT = "station1"
 DEFAULT_VEHICLE = "vehicle01"
+
+
+def _step_value(report: dict, action: str, key: str) -> object:
+    """从编排步骤明细里取某个动作的字段，取不到返回 None。"""
+
+    for step in report.get("steps", []):
+        if step.get("action") == action:
+            return step.get("detail", {}).get(key)
+    return None
 
 
 class Platform:
@@ -70,6 +80,7 @@ class Platform:
         store = JsonStore(self.config.storage_root)
         self.store = store
         self.audit = AuditLog(self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512))
+        self.shifts = ShiftBook(self.clock, self.bus, store)
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=5.0)
@@ -201,6 +212,14 @@ class Platform:
         )
         return summary
 
+    def _record_shift_fact(self, record_type: str, data: dict, op_id: str) -> None:
+        """把成功操作的计量事实挂进活动班次草稿（没开班则跳过）。"""
+
+        try:
+            self.shifts.record_fact(record_type, data, op_id=op_id)
+        except HydroError as error:
+            self.note_error(error)
+
     def start(self) -> dict:
         """启动平台：核对拓扑与命名空间。"""
 
@@ -238,6 +257,17 @@ class Platform:
             summary = self._record_operation(op_id, "unload", report)
             self._operations += 1
             self._persist()
+            if report.get("ok"):
+                self._record_shift_fact(
+                    "unload",
+                    {
+                        "delivered_kg": _step_value(report, "transfer", "delivered_kg"),
+                        "hose_pressure_mpa": _step_value(report, "connect", "pressure_mpa"),
+                        "vented_mpa": _step_value(report, "vent_hold", "vented_mpa"),
+                        "target_kg": target_kg,
+                    },
+                    op_id,
+                )
             return {**report, **summary}
 
     def pressurize(
@@ -305,6 +335,15 @@ class Platform:
                     self.bank.draw(self.meter.total_kg() - before)
                 except HydroError as error:
                     self.note_error(error)
+                self._record_shift_fact(
+                    "fill",
+                    {
+                        "vehicle": vehicle,
+                        "filled_kg": round(self.meter.total_kg() - before, 3),
+                        "steps": steps,
+                    },
+                    op_id,
+                )
             summary = self._record_operation(op_id, "fill", report)
             self._operations += 1
             self._persist()
@@ -394,6 +433,96 @@ class Platform:
             vehicle = self.queue.dequeue()
             self.confirm.open(vehicle, self.clock.now())
             return {"vehicle": vehicle, "size": self.queue.size(), "position": self.queue.position(vehicle)}
+
+    # ----------------------------------------------------------- 班次交接
+
+    def shift_summary(self) -> dict:
+        """班次交接台账摘要。"""
+
+        with self._lock:
+            return self.shifts.summary()
+
+    def shift_active_draft(self) -> dict | None:
+        """当前活动草稿（仅供控制台编辑展示，不对外作交接取数）。"""
+
+        with self._lock:
+            return self.shifts.active_draft()
+
+    def shift_open(self, station: str = DEFAULT_UNIT, facts: list[dict] | None = None) -> dict:
+        """开一个班次草稿，卸氢与加注的成功计量会自动挂进草稿。"""
+
+        with self._lock:
+            return self.shifts.open_shift(station, facts or ())
+
+    def shift_freeze(self, signers: list[str], facts: list[dict] | None = None) -> dict:
+        """签署活动草稿并冻结（冻结点定死为签署时刻）。"""
+
+        with self._lock:
+            return self.shifts.freeze(signers, facts or ())
+
+    def shift_correct(
+        self,
+        fact_id: str,
+        changes: dict,
+        reason: str,
+        author: str,
+        idempotency_key: str | None = None,
+        version_id: str | None = None,
+    ) -> dict:
+        """对人工录入类记录追加更正（幂等）。"""
+
+        with self._lock:
+            return self.shifts.correct(fact_id, changes, reason, author, idempotency_key, version_id)
+
+    def shift_reopen(
+        self,
+        fact_id: str,
+        changes: dict,
+        reason: str,
+        author: str,
+        idempotency_key: str | None = None,
+        version_id: str | None = None,
+    ) -> dict:
+        """对设备计量类记录重开一版草稿，重新签署后生效（幂等）。"""
+
+        with self._lock:
+            return self.shifts.reopen(fact_id, changes, reason, author, idempotency_key, version_id)
+
+    def shift_handover(self) -> dict:
+        """对外交接取数：最新冻结版叠加更正后的有效视图。"""
+
+        with self._lock:
+            return self.shifts.handover()
+
+    def shift_versions(self, shift_id: str | None = None) -> dict:
+        """列出冻结版（控制台展示）。"""
+
+        with self._lock:
+            return {"versions": self.shifts.list_versions(shift_id)}
+
+    def shift_version(self, version_id: str) -> dict:
+        """读取一份历史冻结版原件。"""
+
+        with self._lock:
+            return {"version": self.shifts.get_version(version_id)}
+
+    def shift_effective(self, version_id: str) -> dict:
+        """任一历史版本叠加更正后的有效视图。"""
+
+        with self._lock:
+            return self.shifts.effective(version_id)
+
+    def shift_corrections(self, version_id: str | None = None) -> dict:
+        """列出更正流水。"""
+
+        with self._lock:
+            return {"corrections": self.shifts.corrections(version_id)}
+
+    def shift_reconcile(self) -> dict:
+        """冻结件 × 更正 × 审计三处一致性核对。"""
+
+        with self._lock:
+            return self.shifts.reconcile(self.audit.replay_from_journal())
 
     def namespace(self, address: str) -> dict:
         """按地址解析现场设备。"""
@@ -669,6 +798,7 @@ class Platform:
             "leak_samples": self.leak.samples(),
             "last_audit_ts": self._last_audit_ts,
             "audit": self.audit.summary(),
+            "shift": self.shifts.summary(),
         }
 
     def snapshot(self) -> dict:

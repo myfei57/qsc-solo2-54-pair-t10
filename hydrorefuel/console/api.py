@@ -70,6 +70,18 @@ class Api:
         add("POST", "/api/dequeue", lambda params, body: self._platform.dequeue_vehicle())
         add("POST", "/api/concurrency", self._concurrency)
         add("POST", "/api/reset", lambda params, body: self._platform.reset_state())
+        add("GET", "/api/shift/summary", lambda params, body: self._platform.shift_summary())
+        add("GET", "/api/shift/draft", lambda params, body: {"draft": self._platform.shift_active_draft()})
+        add("GET", "/api/shift/handover", lambda params, body: self._platform.shift_handover())
+        add("GET", "/api/shift/versions", self._shift_versions)
+        add("GET", "/api/shift/version/{version_id}", self._shift_version)
+        add("GET", "/api/shift/effective/{version_id}", self._shift_effective)
+        add("GET", "/api/shift/corrections", self._shift_corrections)
+        add("GET", "/api/shift/reconcile", lambda params, body: self._platform.shift_reconcile())
+        add("POST", "/api/shift/open", self._shift_open)
+        add("POST", "/api/shift/freeze", self._shift_freeze)
+        add("POST", "/api/shift/correct", self._shift_correct)
+        add("POST", "/api/shift/reopen", self._shift_reopen)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -184,3 +196,60 @@ class Api:
 
     def _concurrency(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_probe(rounds=int(body.get("rounds", 24)))
+
+    def _manual_facts(self, body: dict) -> list[dict]:
+        facts = body.get("facts", [])
+        if facts is None:
+            return []
+        if not isinstance(facts, list):
+            raise HydroError("参数 'facts' 必须是记录列表", component="console")
+        return [dict(item) for item in facts if isinstance(item, dict)]
+
+    def _shift_open(self, params: dict, body: dict) -> dict:
+        return self._platform.shift_open(
+            station=str(body.get("station") or self._platform.unit),
+            facts=self._manual_facts(body),
+        )
+
+    def _shift_freeze(self, params: dict, body: dict) -> dict:
+        signers = body.get("signers", [])
+        if isinstance(signers, str):
+            signers = [signers]
+        if not isinstance(signers, list):
+            raise HydroError("参数 'signers' 必须是签署人列表", component="console")
+        return self._platform.shift_freeze(
+            signers=[str(item) for item in signers],
+            facts=self._manual_facts(body),
+        )
+
+    def _shift_correct(self, params: dict, body: dict) -> dict:
+        return self._platform.shift_correct(
+            fact_id=str(body.get("fact_id", "")),
+            changes=dict(body.get("changes", {})),
+            reason=str(body.get("reason", "")),
+            author=str(body.get("author", "")),
+            idempotency_key=body.get("idempotency_key"),
+            version_id=body.get("version_id"),
+        )
+
+    def _shift_reopen(self, params: dict, body: dict) -> dict:
+        return self._platform.shift_reopen(
+            fact_id=str(body.get("fact_id", "")),
+            changes=dict(body.get("changes", {})),
+            reason=str(body.get("reason", "")),
+            author=str(body.get("author", "")),
+            idempotency_key=body.get("idempotency_key"),
+            version_id=body.get("version_id"),
+        )
+
+    def _shift_versions(self, params: dict, body: dict) -> dict:
+        return self._platform.shift_versions(params.get("shift_id"))
+
+    def _shift_version(self, params: dict, body: dict) -> dict:
+        return self._platform.shift_version(str(params.get("version_id", "")))
+
+    def _shift_effective(self, params: dict, body: dict) -> dict:
+        return self._platform.shift_effective(str(params.get("version_id", "")))
+
+    def _shift_corrections(self, params: dict, body: dict) -> dict:
+        return self._platform.shift_corrections(params.get("version_id"))
